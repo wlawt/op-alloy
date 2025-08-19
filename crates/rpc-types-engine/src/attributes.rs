@@ -10,7 +10,8 @@ use alloy_primitives::{B64, Bytes};
 use alloy_rlp::Result;
 use alloy_rpc_types_engine::PayloadAttributes;
 use op_alloy_consensus::{
-    EIP1559ParamError, OpTxEnvelope, decode_eip_1559_params, encode_holocene_extra_data,
+    EIP1559ParamError, OpTxEnvelope, decode_eip_1559_params, decode_min_base_fee_factors,
+    encode_holocene_extra_data, encode_min_base_fee_extra_data,
 };
 
 /// Optimism Payload Attributes
@@ -39,6 +40,13 @@ pub struct OpPayloadAttributes {
     /// Prior to Holocene activation, this field should always be [None].
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub eip_1559_params: Option<B64>,
+    /// If set, this sets the minimum base fee factors for the block, which contains the
+    /// significand (4 bits) and exponent (4 bits) packed into a single byte.
+    ///
+    /// Prior to having the configurable minimum base fee enabled, this field should always be
+    /// [None].
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub min_base_fee_factors: Option<u8>,
 }
 
 impl OpPayloadAttributes {
@@ -58,6 +66,25 @@ impl OpPayloadAttributes {
     /// Returns (`elasticity`, `denominator`)
     pub fn decode_eip_1559_params(&self) -> Option<(u32, u32)> {
         self.eip_1559_params.map(decode_eip_1559_params)
+    }
+
+    /// Encodes the `eip1559` parameters for the payload along with the minimum base fee.
+    pub fn get_min_base_fee_extra_data(
+        &self,
+        default_base_fee_params: BaseFeeParams,
+    ) -> Result<Bytes, EIP1559ParamError> {
+        let (significand, exponent) =
+            self.min_base_fee_factors.map(decode_min_base_fee_factors).unwrap_or_default();
+        self.eip_1559_params
+            .map(|params| {
+                encode_min_base_fee_extra_data(
+                    params,
+                    default_base_fee_params,
+                    significand,
+                    exponent,
+                )
+            })
+            .ok_or(EIP1559ParamError::NoEIP1559Params)?
     }
 
     /// Returns an iterator over the decoded [`OpTxEnvelope`] in this attributes.
@@ -152,6 +179,7 @@ mod test {
             no_tx_pool: Some(true),
             gas_limit: Some(42),
             eip_1559_params: None,
+            min_base_fee_factors: None,
         };
 
         let ser = serde_json::to_string(&attributes).unwrap();
@@ -174,6 +202,7 @@ mod test {
             no_tx_pool: Some(true),
             gas_limit: Some(42),
             eip_1559_params: Some(b64!("0000dead0000beef")),
+            min_base_fee_factors: None,
         };
 
         let ser = serde_json::to_string(&attributes).unwrap();
@@ -198,5 +227,75 @@ mod test {
             OpPayloadAttributes { eip_1559_params: Some(B64::ZERO), ..Default::default() };
         let extra_data = attributes.get_holocene_extra_data(BaseFeeParams::new(80, 60));
         assert_eq!(extra_data.unwrap(), Bytes::copy_from_slice(&[0, 0, 0, 0, 80, 0, 0, 0, 60]));
+    }
+
+    #[test]
+    fn test_serde_roundtrip_attributes_pre_min_base_fee() {
+        let attributes = OpPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 0x1337,
+                prev_randao: B256::ZERO,
+                suggested_fee_recipient: Address::ZERO,
+                withdrawals: Default::default(),
+                parent_beacon_block_root: Some(B256::ZERO),
+            },
+            transactions: Some(vec![b"hello".to_vec().into()]),
+            no_tx_pool: Some(true),
+            gas_limit: Some(42),
+            eip_1559_params: Some(b64!("0000dead0000beef")),
+            min_base_fee_factors: None,
+        };
+
+        let ser = serde_json::to_string(&attributes).unwrap();
+        let de: OpPayloadAttributes = serde_json::from_str(&ser).unwrap();
+
+        assert_eq!(attributes, de);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_attributes_post_min_base_fee() {
+        let attributes = OpPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 0x1337,
+                prev_randao: B256::ZERO,
+                suggested_fee_recipient: Address::ZERO,
+                withdrawals: Default::default(),
+                parent_beacon_block_root: Some(B256::ZERO),
+            },
+            transactions: Some(vec![b"hello".to_vec().into()]),
+            no_tx_pool: Some(true),
+            gas_limit: Some(42),
+            eip_1559_params: None,
+            min_base_fee_factors: Some(1),
+        };
+
+        let ser = serde_json::to_string(&attributes).unwrap();
+        let de: OpPayloadAttributes = serde_json::from_str(&ser).unwrap();
+
+        assert_eq!(attributes, de);
+    }
+
+    #[test]
+    fn test_get_extra_data_post_min_base_fee() {
+        let attributes = OpPayloadAttributes {
+            eip_1559_params: Some(B64::from_str("0x0000000800000008").unwrap()),
+            min_base_fee_factors: Some(1),
+            ..Default::default()
+        };
+
+        let extra_data = attributes.get_min_base_fee_extra_data(BaseFeeParams::new(80, 60));
+        assert_eq!(extra_data.unwrap(), Bytes::copy_from_slice(&[1, 0, 0, 0, 8, 0, 0, 0, 8, 1]));
+    }
+
+    #[test]
+    fn test_get_extra_data_post_min_base_fee_default() {
+        let attributes = OpPayloadAttributes {
+            eip_1559_params: Some(B64::ZERO),
+            min_base_fee_factors: Some(0),
+            ..Default::default()
+        };
+
+        let extra_data = attributes.get_min_base_fee_extra_data(BaseFeeParams::new(80, 60));
+        assert_eq!(extra_data.unwrap(), Bytes::copy_from_slice(&[1, 0, 0, 0, 80, 0, 0, 0, 60, 0]));
     }
 }
